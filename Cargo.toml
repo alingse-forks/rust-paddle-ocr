@@ -60,8 +60,8 @@ rayon = "1.10"
 cbindgen = "0.24"
 
 [dependencies.mnn]
-git = "https://github.com/aftershootco/mnn-rs.git"
-# path = "../mnn-rs"
+# git = "https://github.com/aftershootco/mnn-rs.git"
+path = "../mnn-rs"
 features = []
 
 [dev-dependencies]
