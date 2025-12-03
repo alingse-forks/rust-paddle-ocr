@@ -11,6 +11,20 @@ fn main() {
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
 
+    // 添加 SSE 编译器标志
+    if target_os == "windows" && target_arch == "x86_64" {
+        // 对于 Windows MSVC 目标，添加 SSE 编译器标志
+        println!("cargo:rustc-cfg=feature=\"sse2\"");
+        // 通过环境变量传递编译器标志
+        // 对于 clang-cl，使用 -msse4.1 标志
+        // /arch:SSE2 是 MSVC 风格的标志，clang-cl 可能不支持
+        println!("cargo:rustc-env=CFLAGS=-msse4.1");
+        println!("cargo:rustc-env=CXXFLAGS=-msse4.1");
+        // 添加链接器标志
+        // 对于 MSVC 目标，SSE 内置函数在运行时库中
+        println!("cargo:rustc-link-arg=/DEFAULTLIB:libcmt");
+    }
+
     let rocr_h_path = output_dir.join("rocr.h");
 
     // 使用更简单的cbindgen配置
