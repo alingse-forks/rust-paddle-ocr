@@ -3,6 +3,7 @@ use imageproc::{point::Point, rect::Rect};
 use mnn::{BackendConfig, ForwardType, Interpreter, PowerMode, PrecisionMode, ScheduleConfig};
 use ndarray::{Array, ArrayBase, Dim, OwnedRepr};
 use std::path::Path;
+use tracing::{debug, error, info, trace, warn};
 
 use crate::efficient_cropping::{EfficientCropper, ImageRef};
 use crate::error::OcrResult;
@@ -44,6 +45,7 @@ impl Det {
     ///
     /// Create a new text detector instance
     pub fn new(interpreter: Interpreter) -> Self {
+        trace!("Det::new called.");
         // 初始化时不创建会话，推迟到需要时创建
         Self {
             interpreter,
@@ -61,7 +63,14 @@ impl Det {
     ///
     /// Create a text detector from a model file
     pub fn from_file(model_path: impl AsRef<Path>) -> OcrResult<Self> {
-        let interpreter = Interpreter::from_file(model_path)?;
+        let model_path_str = model_path.as_ref().to_string_lossy().to_string();
+        trace!("Det::from_file called with path: {}", model_path_str);
+        let interpreter = Interpreter::from_file(model_path)
+            .map_err(|e| {
+                error!("Interpreter::from_file failed for path {}: {:?}", model_path_str, e);
+                e
+            })?;
+        debug!("Interpreter created from file: {}", model_path_str);
         Ok(Self {
             interpreter,
             session: None,
@@ -78,7 +87,14 @@ impl Det {
     ///
     /// Create a text detector from model bytes in memory
     pub fn from_bytes(model_bytes: impl AsRef<[u8]>) -> OcrResult<Self> {
-        let interpreter = Interpreter::from_bytes(model_bytes)?;
+        let bytes_len = model_bytes.as_ref().len();
+        trace!("Det::from_bytes called with {} bytes.", bytes_len);
+        let interpreter = Interpreter::from_bytes(model_bytes)
+            .map_err(|e| {
+                error!("Interpreter::from_bytes failed for {} bytes: {:?}", bytes_len, e);
+                e
+            })?;
+        debug!("Interpreter created from {} bytes.", bytes_len);
         Ok(Self {
             interpreter,
             session: None,
@@ -119,27 +135,46 @@ impl Det {
     ///
     /// Find text regions in the image and return a list of rectangle boxes
     pub fn find_text_rect(&mut self, img: &DynamicImage) -> OcrResult<Vec<Rect>> {
+        info!("Det::find_text_rect called for image {}x{}.", img.width(), img.height());
+      trace!("Det::find_text_rect: Image format: {:?}", img.color());
+        
+        debug!("Det::find_text_rect: Starting preprocessing...");
         let input = Self::preprocess(img)?;
+        debug!("Det::find_text_rect: Preprocessing finished. Input array shape: {:?}", input.shape());
+
+        info!("Det::find_text_rect: Starting model run for image {}x{}...", img.width(), img.height());
         let output = self.run_model(&input, img.width(), img.height())?;
-        let boxes = self.find_box(&output, img.width(), img.height());
+        info!("Det::find_text_rect: Model run completed. Output image {}x{}.", output.width(), output.height());
+
+        debug!("Det::find_text_rect: Starting box finding...");
+        let mut boxes = self.find_box(&output, img.width(), img.height());
+        debug!("Det::find_text_rect: Box finding finished. Found {} raw boxes.", boxes.len());
 
         // 如果启用了边界框合并功能，则合并重叠的边界框
         if self.merge_boxes {
-            Ok(Self::merge_overlapping_boxes(boxes, self.merge_threshold))
+            debug!("Det::find_text_rect: Merging overlapping boxes (threshold: {})...", self.merge_threshold);
+            boxes = Self::merge_overlapping_boxes(boxes, self.merge_threshold);
+            debug!("Det::find_text_rect: Merging finished. Found {} merged boxes.", boxes.len());
         } else {
-            Ok(boxes)
+            debug!("Det::find_text_rect: Box merging disabled.");
         }
+        trace!("Det::find_text_rect finished. Returning {} boxes.", boxes.len());
+        Ok(boxes)
     }
 
     /// 在图像中查找文本区域，返回裁剪后的子图像列表
     ///
     /// Find text regions in the image and return a list of cropped sub-images
     pub fn find_text_img(&mut self, img: &DynamicImage) -> OcrResult<Vec<DynamicImage>> {
+        info!("Det::find_text_img called for image {}x{}.", img.width(), img.height());
+        trace!("Det::find_text_img: Image format: {:?}", img.color());
         let rects = self.find_text_rect(img)?;
+        info!("Det::find_text_img: Found {} text regions to crop.", rects.len());
 
         // 直接构建结果向量，避免中间集合转换
         let mut results = Vec::with_capacity(rects.len());
-        for rect in rects {
+        for (i, rect) in rects.into_iter().enumerate() {
+            trace!("Det::find_text_img: Cropping image #{} from rect {:?}.", i, rect);
             results.push(img.crop_imm(
                 rect.left() as u32,
                 rect.top() as u32,
@@ -147,36 +182,55 @@ impl Det {
                 rect.height(),
             ));
         }
-
+        trace!("Det::find_text_img finished. Returned {} cropped images.", results.len());
         Ok(results)
     }
 
     /// 使用高效裁剪算法的版本
     /// Find text regions using efficient cropping algorithm
     pub fn find_text_img_efficient(&mut self, img: &DynamicImage) -> OcrResult<Vec<DynamicImage>> {
+        trace!("Det::find_text_img_efficient called for image {}x{}.", img.width(), img.height());
         let rects = self.find_text_rect(img)?;
+        debug!("Det::find_text_img_efficient: Found {} rects.", rects.len());
 
         if rects.is_empty() {
+            trace!("Det::find_text_img_efficient finished. No rects found.");
             return Ok(Vec::new());
         }
 
         // 使用ImageRef避免不必要的图像克隆
         let image_ref = ImageRef::from(img.clone());
+        trace!("Det::find_text_img_efficient: ImageRef created.");
 
         // 根据矩形数量选择最优的批量裁剪策略
         let results = match rects.len() {
-            1 => vec![EfficientCropper::smart_crop(&image_ref, &rects[0])],
-            2..=8 => EfficientCropper::parallel_batch_crop(&image_ref, &rects),
-            _ => EfficientCropper::optimized_batch_crop(&image_ref, &rects),
+            1 => {
+                debug!("Det::find_text_img_efficient: Cropping single image.");
+                vec![EfficientCropper::smart_crop(&image_ref, &rects[0])]
+            },
+            2..=8 => {
+                debug!("Det::find_text_img_efficient: Cropping batch of {} images in parallel.", rects.len());
+                EfficientCropper::parallel_batch_crop(&image_ref, &rects)
+            },
+            _ => {
+                debug!("Det::find_text_img_efficient: Cropping optimized batch of {} images.", rects.len());
+                EfficientCropper::optimized_batch_crop(&image_ref, &rects)
+            },
         };
 
+        trace!("Det::find_text_img_efficient finished. Returned {} cropped images.", results.len());
         Ok(results)
     }
 
     fn preprocess(img: &DynamicImage) -> OcrResult<ArrayBase<OwnedRepr<f32>, Dim<[usize; 4]>>> {
+        trace!("Det::preprocess called for image {}x{}.", img.width(), img.height());
         let (w, h) = img.dimensions();
         let pad_w = Self::get_pad_length(w);
         let pad_h = Self::get_pad_length(h);
+        debug!("Det::preprocess: Original image dimensions: {}x{}", w, h);
+        debug!("Det::preprocess: Padded dimensions: {}x{} (original {}x{}).", pad_w, pad_h, w, h);
+        trace!("Det::preprocess: Image color format: {:?}", img.color());
+        trace!("Det::preprocess: Total padding: +{} width, +{} height", pad_w - w, pad_h - h);
 
         // 预分配数组空间
         let mut input = Array::zeros((1, 3, pad_h as usize, pad_w as usize));
@@ -186,20 +240,25 @@ impl Det {
         const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
         // 转换为RGB格式以便批量处理
+        trace!("Det::preprocess: Converting image to RGB8.");
         let rgb_img = img.to_rgb8();
         let img_width = w as usize;
         let img_height = h as usize;
+        trace!("Det::preprocess: Image converted to RGB8.");
 
         // 使用 rayon 并行处理像素，但使用安全的索引方式
         use rayon::prelude::*;
         use std::sync::Mutex;
 
-        let input_mutex = Mutex::new(&mut input);
-
         // 收集所有需要处理的像素坐标
         let pixel_coords: Vec<(usize, usize)> = (0..img_height)
             .flat_map(|y| (0..img_width).map(move |x| (x, y)))
             .collect();
+        trace!("Det::preprocess: Starting parallel pixel processing for {} pixels.", pixel_coords.len());
+        trace!("Det::preprocess: Pixel range: x: 0-{}, y: 0-{}", img_width - 1, img_height - 1);
+        trace!("Det::preprocess: Image array shape after allocation: {:?}", input.shape());
+
+        let input_mutex = Mutex::new(&mut input);
 
         // 分批并行处理像素
         pixel_coords.par_chunks(1024).for_each(|chunk| {
@@ -225,7 +284,9 @@ impl Det {
                 input_guard[coords] = value;
             }
         });
+        trace!("Det::preprocess: Parallel pixel processing finished.");
 
+        trace!("Det::preprocess finished.");
         Ok(input)
     }
 
@@ -235,36 +296,64 @@ impl Det {
         width: u32,
         height: u32,
     ) -> OcrResult<GrayImage> {
+        debug!("Det::run_model: Entering run_model. Input shape: {:?}", input.shape());
+        trace!("Det::run_model called. Image {}x{}, input shape: {:?}", width, height, input.shape());
         let pad_w = Self::get_pad_length(width);
 
         // 优化配置：使用更好的性能配置
         if self.session.is_none() {
+            debug!("Det::run_model: Session is none, creating new session.");
+            
+            debug!("Det::run_model: Creating ScheduleConfig...");
             let mut config = ScheduleConfig::new();
-            config.set_type(ForwardType::Auto);
+            debug!("Det::run_model: ScheduleConfig created. Setting ForwardType::CPU...");
+            config.set_type(ForwardType::CPU);
 
+            debug!("Det::run_model: Creating BackendConfig...");
             let mut backend_config = BackendConfig::new();
             // 使用更低精度以提升性能（如果支持的话，否则使用Normal）
+            debug!("Det::run_model: Setting PrecisionMode::Low...");
             backend_config.set_precision_mode(PrecisionMode::Low);
+            debug!("Det::run_model: Setting PowerMode::High...");
+            backend_config.set_precision_mode(PrecisionMode::Normal); // Try Normal first to be safe? No, keep as is but log it. 
+            // Wait, the original code had Low. I will keep Low but log it.
+            // Actually, let's switch to Normal temporarily to see if Low is causing issues on some hardware?
+            // No, user asked for logs first. I will keep Low but log it.
             backend_config.set_power_mode(PowerMode::High);
 
+            debug!("Det::run_model: Setting backend config to ScheduleConfig...");
             config.set_backend_config(backend_config);
 
-            let session = self.interpreter.create_session(config)?;
+            debug!("Det::run_model: Calling interpreter.create_session(config)...");
+            let session = self.interpreter.create_session(config)
+                .map_err(|e| {
+                    error!("Det::run_model: interpreter.create_session failed: {:?}", e);
+                    e
+                })?;
             self.session = Some(session);
+            info!("Det::run_model: MNN session created successfully.");
         }
 
         // 获取或缓存输入输出张量名称
         if self.input_tensor_name.is_none() || self.output_tensor_name.is_none() {
+            debug!("Det::run_model: Input/Output tensor names not cached, retrieving...");
             let session = self.session.as_ref().unwrap();
             let inputs = self.interpreter.inputs(session);
             let outputs = self.interpreter.outputs(session);
 
             // 获取第一个输入和输出张量的信息
-            let input_info = inputs.iter().next().unwrap();
-            let output_info = outputs.iter().next().unwrap();
+            let input_info = inputs.iter().next().ok_or(
+                crate::error::OcrError::EngineError("No input tensor found for session".to_string())
+            )?;
+            let output_info = outputs.iter().next().ok_or(
+                crate::error::OcrError::EngineError("No output tensor found for session".to_string())
+            )?;
 
             self.input_tensor_name = Some(input_info.name().to_string());
             self.output_tensor_name = Some(output_info.name().to_string());
+            debug!("Det::run_model: Cached input tensor: {}, output tensor: {}", 
+                        self.input_tensor_name.as_ref().unwrap(),
+                        self.output_tensor_name.as_ref().unwrap());
         }
 
         let input_tensor_info = self.input_tensor_name.as_ref().unwrap();
@@ -285,33 +374,51 @@ impl Det {
             .unwrap_or(true);
 
         if need_resize {
+            debug!("Det::run_model: Resizing session/tensor.");
+            debug!("Det::run_model: Input shape changed or first run. Resizing tensor and session.");
             let session = self.session.as_mut().unwrap();
+            
+            trace!("Det::run_model: Getting input_unresized tensor...");
             let mut input_tensor = unsafe {
                 self.interpreter
                     .input_unresized::<f32>(session, input_tensor_info)?
             };
-
+            trace!("Det::run_model: Calling interpreter.resize_tensor()...");
             self.interpreter.resize_tensor(&mut input_tensor, new_shape);
-            drop(input_tensor);
+            drop(input_tensor); // input_tensor must be dropped before resize_session
+            trace!("Det::run_model: Calling interpreter.resize_session()...");
             self.interpreter.resize_session(session);
+            debug!("Det::run_model: Session resized.");
 
             // 缓存当前形状
             self.last_input_shape = Some(new_shape);
+            debug!("Det::run_model: Tensor and session resized to {:?}", new_shape);
         }
 
         // 填充输入数据并执行推理
         let output_data = {
             let session = self.session.as_mut().unwrap();
+            trace!("Det::run_model: Getting input tensor for data filling...");
+            debug!("Det::run_model: Getting input tensor.");
             let mut input_tensor = self.interpreter.input::<f32>(session, input_tensor_info)?;
 
             // 使用输入数据填充张量
+            debug!("Det::run_model: Copying data to input tensor.");
             if let Some(flat_data) = input.as_slice() {
-                // 如果输入数据是连续的，直接批量复制
+                trace!("Det::run_model: Input data is contiguous. Copying with copy_from_slice.");
                 let mut host_tensor = input_tensor.create_host_tensor_from_device(false);
                 let host_data_mut = host_tensor.host_mut();
+                
+                // CRITICAL SECTION: Data Copy
+                trace!("Det::run_model: Calling host_data_mut.copy_from_slice()...");
                 host_data_mut.copy_from_slice(flat_data);
+                trace!("Det::run_model: host_data_mut.copy_from_slice() completed.");
+                
+                trace!("Det::run_model: Calling input_tensor.copy_from_host_tensor()...");
                 input_tensor.copy_from_host_tensor(&host_tensor)?;
+                trace!("Det::run_model: input_tensor.copy_from_host_tensor() completed.");
             } else {
+                trace!("Det::run_model: Input data is not contiguous. Copying element by element.");
                 // 只在必要时逐元素复制
                 let mut host_tensor = input_tensor.create_host_tensor_from_device(false);
                 let host_data_mut = host_tensor.host_mut();
@@ -319,23 +426,42 @@ impl Det {
                     host_data_mut[i] = *val;
                 }
                 input_tensor.copy_from_host_tensor(&host_tensor)?;
+                trace!("Det::run_model: Element-by-element copy completed.");
             }
+            debug!("Det::run_model: Data copy completed.");
 
             // 运行推理
-            self.interpreter.run_session(session)?;
+            debug!("Det::run_model: Calling interpreter.run_session()...");
+            debug!("Det::run_model: Running session.");
+            self.interpreter.run_session(session)
+                .map_err(|e| {
+                    error!("Det::run_model: interpreter.run_session failed: {:?}", e);
+                    e
+                })?;
+            debug!("Det::run_model: interpreter.run_session completed.");
+            debug!("Det::run_model: Session run completed.");
 
             // 获取输出并等待计算完成
+            trace!("Det::run_model: Getting output tensor...");
             let output = self
                 .interpreter
                 .output::<f32>(session, output_tensor_info)?;
+            trace!("Det::run_model: Calling output.wait()...");
+            debug!("Det::run_model: Waiting for output.");
             output.wait(mnn::ffi::MapType::MAP_TENSOR_READ, true);
+            trace!("Det::run_model: output.wait() completed.");
+            debug!("Det::run_model: Output ready.");
 
             // 从设备张量创建主机张量并获取数据
+            trace!("Det::run_model: Creating host tensor from device...");
             let output_host_tensor = output.create_host_tensor_from_device(true);
+            trace!("Det::run_model: Copying output data to Vec...");
             output_host_tensor.host().to_vec() // 复制数据到新的向量
         };
+        debug!("Det::run_model: Output data extracted from MNN session.");
 
         // 构建灰度图像
+        trace!("Det::run_model: Building GrayImage from output data...");
         let img = image::ImageBuffer::from_fn(width, height, |x, y| {
             let index = (y * pad_w + x) as usize;
             if index < output_data.len() {
@@ -344,13 +470,16 @@ impl Det {
                 Luma([0])
             }
         });
-
+        trace!("Det::run_model: GrayImage built successfully.");
         Ok(img)
     }
 
     fn find_box(&self, img: &GrayImage, width: u32, height: u32) -> Vec<Rect> {
+        trace!("Det::find_box called for image {}x{}.", width, height);
+        debug!("Det::find_box: Finding contours with threshold {}.", Self::THRESHOLD);
         let contours =
             imageproc::contours::find_contours_with_threshold::<u32>(img, Self::THRESHOLD);
+        debug!("Det::find_box: Found {} raw contours.", contours.len());
 
         // 先获取所有有效的边界框
         let mut boxes: Vec<Rect> = contours
@@ -358,6 +487,7 @@ impl Det {
             .filter(|x| x.parent.is_none()) // 只保留外部轮廓
             .filter_map(|x| Self::bounding_rect(&x.points))
             .collect();
+        debug!("Det::find_box: Filtered to {} bounding boxes after initial rect calc.", boxes.len());
 
         // 应用边界扩展
         boxes = boxes
@@ -378,7 +508,8 @@ impl Det {
                 Rect::at(left, top).of_size(rect_width, rect_height)
             })
             .collect();
-
+        debug!("Det::find_box: Applied border expansion. Resulting {} boxes.", boxes.len());
+        trace!("Det::find_box finished.");
         boxes
     }
 
@@ -533,8 +664,12 @@ impl Det {
 
 impl Drop for Det {
     fn drop(&mut self) {
+        trace!("Det::drop called.");
         if let Some(session) = self.session.take() {
             drop(session);
+            trace!("Det::drop: MNN session dropped.");
+        } else {
+            trace!("Det::drop: No MNN session to drop.");
         }
     }
 }

@@ -1,3 +1,4 @@
+extern crate cbindgen;
 use std::env;
 use std::path::PathBuf;
 
@@ -6,6 +7,11 @@ fn main() {
     let output_dir = target_dir();
 
     std::fs::create_dir_all(&output_dir).expect("Failed to create output directory");
+
+    let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
+
+    let rocr_h_path = output_dir.join("rocr.h");
 
     // 使用更简单的cbindgen配置
     let config = cbindgen::Config {
@@ -41,18 +47,33 @@ fn main() {
         ..Default::default()
     };
 
-    match cbindgen::Builder::new()
-        .with_crate(crate_dir)
-        .with_config(config)
-        .generate()
-    {
-        Ok(bindings) => {
-            bindings.write_to_file(output_dir.join("rocr.h"));
-            println!("cargo:rerun-if-changed=src/capi.rs");
-            println!("cargo:rerun-if-changed=src/lib.rs");
+
+    if target_os == "windows" && target_arch == "x86_64" {
+        // When cross-compiling to Windows MSVC, skip cbindgen and expect a pre-generated rocr.h
+        // This is a workaround for cbindgen's interaction with cargo-xwin's RUSTFLAGS.
+        if !rocr_h_path.exists() {
+            panic!("When cross-compiling to x86_64-pc-windows-msvc, rocr.h must be pre-generated. Please run `cargo build` on macOS/Linux for the host target first, copy `target/debug/build/rust-paddle-ocr-.../out/rocr.h` to `repos/rust-paddle-ocr/rocr.h` (or a known location), and re-run.");
         }
-        Err(e) => {
-            panic!("cbindgen failed to generate bindings: {:?}", e);
+        println!("cargo:rerun-if-changed=src/capi.rs");
+        println!("cargo:rerun-if-changed=src/lib.rs");
+        // Assume rocr.h is already present, so just print rerun-if-changed and continue.
+        // In a real scenario, you'd probably copy the pre-generated file if it's external.
+        // For this task, we'll assume the user will manually place it if needed.
+    } else {
+        // For host builds (macOS/Linux), generate rocr.h as usual
+        match cbindgen::Builder::new()
+            .with_crate(crate_dir)
+            .with_config(config)
+            .generate()
+        {
+            Ok(bindings) => {
+                bindings.write_to_file(rocr_h_path);
+                println!("cargo:rerun-if-changed=src/capi.rs");
+                println!("cargo:rerun-if-changed=src/lib.rs");
+            }
+            Err(e) => {
+                panic!("cbindgen failed to generate bindings: {:?}", e);
+            }
         }
     }
 }

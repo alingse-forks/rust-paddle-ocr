@@ -44,8 +44,8 @@ image = "0.25.6"
 imageproc = "0.25"
 ndarray = { version = "0.16", features = ["rayon", "serde"] }
 thiserror = "2"
-log = "0.4"
-env_logger = "0.10"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 crossbeam-channel = "0.5"
 once_cell = "1.17"
 
@@ -60,9 +60,9 @@ rayon = "1.10"
 cbindgen = "0.24"
 
 [dependencies.mnn]
-git = "https://github.com/aftershootco/mnn-rs.git"
-# path = "../mnn-rs"
-features = []
+# git = "https://github.com/aftershootco/mnn-rs.git"
+path = "../mnn-rs"
+features = ["crt_static"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

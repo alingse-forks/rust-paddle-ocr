@@ -1,8 +1,9 @@
 use clap::{Parser, ValueEnum};
-use log::{error, info};
 use rust_paddle_ocr::{OcrEngineManager, OcrError, OcrResult};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tracing::{error, info};
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 // 根据feature flag选择不同版本的模型
 #[cfg(feature = "v5")]
@@ -88,13 +89,20 @@ fn main() -> OcrResult<()> {
         }
     };
 
-    // 配置日志
-    if args.verbose {
-        std::env::set_var("RUST_LOG", "info");
+    // 配置tracing日志
+    let log_level = if args.verbose {
+        "info"
     } else {
-        std::env::set_var("RUST_LOG", "error");
-    }
-    env_logger::init();
+        "error"
+    };
+
+    tracing_subscriber::fmt()
+        .with_env_filter(log_level)
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
+        .init();
 
     info!("Starting PaddleOCR command line tool");
 

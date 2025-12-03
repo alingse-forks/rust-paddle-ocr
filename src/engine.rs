@@ -8,6 +8,7 @@ use std::{
     sync::{Arc, Mutex},
     thread,
 };
+use tracing::{debug, error, info, trace, warn};
 
 /// OCR请求类型
 ///
@@ -293,6 +294,7 @@ impl OcrEngine {
     ///
     /// Complete OCR processing, detecting and recognizing all text in the image
     pub fn process_ocr(&self, image: DynamicImage) -> OcrResult<Vec<String>> {
+        trace!("OcrEngine::process_ocr called, sending request to worker thread.");
         // 创建结果通道
         let (result_tx, result_rx) = unbounded();
 
@@ -302,14 +304,18 @@ impl OcrEngine {
                 image,
                 result_sender: result_tx,
             })
-            .map_err(|_| {
+            .map_err(|e| {
+                error!("Failed to send OcrRequest::ProcessOcr to worker thread: {:?}", e);
                 OcrError::EngineError("OCR engine worker thread has terminated".to_string())
             })?;
 
         // 等待结果
-        result_rx.recv().map_err(|_| {
+        let res = result_rx.recv().map_err(|e| {
+            error!("Failed to receive result from worker thread for ProcessOcr: {:?}", e);
             OcrError::EngineError("Failed to receive result from worker thread".to_string())
-        })?
+        })?;
+        trace!("OcrEngine::process_ocr received result from worker thread.");
+        res
     }
 
     /// 使用高效裁剪获取文本区域图像
@@ -370,22 +376,39 @@ impl OcrEngine {
         merge_boxes: bool,
         merge_threshold: i32,
     ) -> OcrResult<()> {
+        trace!("OCR worker thread started.");
+        debug!("Worker: Initializing Det model from path: {:?}", det_model_path.as_ref());
         // 初始化模型，应用自定义配置
-        let mut det = Det::from_file(det_model_path)?
+        let mut det = Det::from_file(det_model_path)
+            .map_err(|e| {
+                error!("Worker: Det model initialization failed: {:?}", e);
+                e
+            })?
             .with_rect_border_size(rect_border_size)
             .with_merge_boxes(merge_boxes)
             .with_merge_threshold(merge_threshold);
+        debug!("Worker: Det model initialized.");
 
-        let mut rec = Rec::from_file(rec_model_path, keys_path)?;
+        debug!("Worker: Initializing Rec model from path: {:?}", rec_model_path.as_ref());
+        let mut rec = Rec::from_file(rec_model_path, keys_path)
+            .map_err(|e| {
+                error!("Worker: Rec model initialization failed: {:?}", e);
+                e
+            })?;
+        debug!("Worker: Rec model initialized.");
 
+        trace!("Worker: Entering request processing loop.");
         // 处理请求循环
         for request in receiver {
+            trace!("Worker: Received request: {:?}", request);
             match request {
                 OcrRequest::DetectText {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing DetectText request.");
                     let result = det.find_text_img(&image);
+                    debug!("Worker: DetectText result obtained.");
                     // 发送结果，忽略接收端可能已关闭的错误
                     let _ = result_sender.send(result);
                 }
@@ -393,44 +416,70 @@ impl OcrEngine {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing GetTextRects request.");
                     let result = det.find_text_rect(&image);
+                    debug!("Worker: GetTextRects result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::GetTextImages {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing GetTextImages request.");
                     let result = det.find_text_img(&image);
+                    debug!("Worker: GetTextImages result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::RecognizeText {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing RecognizeText request.");
                     let result = rec.predict_str(&image);
+                    debug!("Worker: RecognizeText result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::ProcessOcr {
                     image,
                     result_sender,
                 } => {
+                    let (img_width, img_height) = (image.width(), image.height());
+                    info!("Worker: Processing ProcessOcr request. Image size: {}x{}", img_width, img_height);
+                    info!("Worker: Starting OCR processing pipeline for ProcessOcr request");
+                    warn!("Worker: OCR Request Type: ProcessOcr - Full OCR pipeline starting");
+
                     // 先检测文本区域
+                    debug!("Worker: Calling det.find_text_img for ProcessOcr.");
+                    trace!("Worker: Input image format: {:?}", image.color());
+                    trace!("Worker: Input image pixel count: {}", img_width * img_height);
+
                     match det.find_text_img(&image) {
                         Ok(text_images) => {
+                            debug!("Worker: det.find_text_img returned {} images. Starting recognition.", text_images.len());
+                            info!("Worker: Text detection phase completed. Found {} text regions to recognize.", text_images.len());
                             // 识别每个文本区域
                             let mut results = Vec::with_capacity(text_images.len());
-                            for text_img in text_images {
+                            for (i, text_img) in text_images.into_iter().enumerate() {
+                                let (text_width, text_height) = (text_img.width(), text_img.height());
+                                trace!("Worker: Recognizing text for image #{}... Size: {}x{}", i, text_width, text_height);
+                                debug!("Worker: Calling rec.predict_str for text image #{} with size {}x{}", i, text_width, text_height);
+
                                 match rec.predict_str(&text_img) {
                                     Ok(text) => results.push(text),
                                     Err(e) => {
+                                        error!("Worker: Rec::predict_str failed for image #{}: {:?}", i, e);
+                                        error!("Worker: Text image #{} details - size: {}x{}, format: {:?}", i, text_width, text_height, text_img.color());
                                         let _ = result_sender.send(Err(e));
                                         break;
                                     }
                                 }
                             }
+                            debug!("Worker: All text images recognized for ProcessOcr.");
+                            info!("Worker: OCR pipeline completed successfully. Returning {} recognized texts.", results.len());
                             let _ = result_sender.send(Ok(results));
                         }
                         Err(e) => {
+                            error!("Worker: det.find_text_img failed for ProcessOcr: {:?}", e);
                             let _ = result_sender.send(Err(e));
                         }
                     }
@@ -439,41 +488,51 @@ impl OcrEngine {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing GetTextImagesEfficient request.");
                     let result = det.find_text_img_efficient(&image);
+                    debug!("Worker: GetTextImagesEfficient result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::ProcessOcrEfficient {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker: Processing ProcessOcrEfficient request.");
                     // 使用高效裁剪先检测文本区域
+                    debug!("Worker: Calling det.find_text_img_efficient for ProcessOcrEfficient.");
                     match det.find_text_img_efficient(&image) {
                         Ok(text_images) => {
+                            debug!("Worker: det.find_text_img_efficient returned {} images. Starting recognition.", text_images.len());
                             // 识别每个文本区域
                             let mut results = Vec::with_capacity(text_images.len());
-                            for text_img in text_images {
+                            for (i, text_img) in text_images.into_iter().enumerate() {
+                                trace!("Worker: Recognizing text for image #{}...", i);
                                 match rec.predict_str(&text_img) {
                                     Ok(text) => results.push(text),
                                     Err(e) => {
+                                        error!("Worker: Rec::predict_str failed for image #{}: {:?}", i, e);
                                         let _ = result_sender.send(Err(e));
                                         break;
                                     }
                                 }
                             }
+                            debug!("Worker: All text images recognized for ProcessOcrEfficient.");
                             let _ = result_sender.send(Ok(results));
                         }
                         Err(e) => {
+                            error!("Worker: det.find_text_img_efficient failed for ProcessOcrEfficient: {:?}", e);
                             let _ = result_sender.send(Err(e));
                         }
                     }
                 }
                 OcrRequest::Shutdown => {
+                    info!("Worker: Received Shutdown request, exiting loop.");
                     // 收到关闭请求，退出循环
                     break;
                 }
             }
         }
-
+        trace!("OCR worker thread finished.");
         Ok(())
     }
 
@@ -489,22 +548,36 @@ impl OcrEngine {
         merge_boxes: bool,
         merge_threshold: i32,
     ) -> OcrResult<()> {
+        trace!("OCR worker thread (from bytes) started.");
+        debug!("Worker (bytes): Initializing Det model from bytes.");
         // 直接从字节数据初始化模型
-        let mut det = Det::from_bytes(&det_model_data)?
-            .with_rect_border_size(rect_border_size)
-            .with_merge_boxes(merge_boxes)
-            .with_merge_threshold(merge_threshold);
+        let mut det = Det::from_bytes(&det_model_data)
+            .map_err(|e| {
+                error!("Worker (bytes): Det model initialization failed from bytes: {:?}", e);
+                e
+            })?;
+        debug!("Worker (bytes): Det model initialized from bytes.");
 
-        let mut rec = Rec::from_bytes_with_keys(&rec_model_data, &keys_data)?;
+        debug!("Worker (bytes): Initializing Rec model from bytes.");
+        let mut rec = Rec::from_bytes_with_keys(&rec_model_data, &keys_data)
+            .map_err(|e| {
+                error!("Worker (bytes): Rec model initialization failed from bytes: {:?}", e);
+                e
+            })?;
+        debug!("Worker (bytes): Rec model initialized from bytes.");
 
+        trace!("Worker (bytes): Entering request processing loop.");
         // 处理请求循环
         for request in receiver {
+            trace!("Worker (bytes): Received request: {:?}", request);
             match request {
                 OcrRequest::DetectText {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing DetectText request.");
                     let result = det.find_text_img(&image);
+                    debug!("Worker (bytes): DetectText result obtained.");
                     // 发送结果，忽略接收端可能已关闭的错误
                     let _ = result_sender.send(result);
                 }
@@ -512,44 +585,57 @@ impl OcrEngine {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing GetTextRects request.");
                     let result = det.find_text_rect(&image);
+                    debug!("Worker (bytes): GetTextRects result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::GetTextImages {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing GetTextImages request.");
                     let result = det.find_text_img(&image);
+                    debug!("Worker (bytes): GetTextImages result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::RecognizeText {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing RecognizeText request.");
                     let result = rec.predict_str(&image);
+                    debug!("Worker (bytes): RecognizeText result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::ProcessOcr {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing ProcessOcr request.");
                     // 先检测文本区域
+                    debug!("Worker (bytes): Calling det.find_text_img for ProcessOcr.");
                     match det.find_text_img(&image) {
                         Ok(text_images) => {
+                            debug!("Worker (bytes): det.find_text_img returned {} images. Starting recognition.", text_images.len());
                             // 识别每个文本区域
                             let mut results = Vec::with_capacity(text_images.len());
-                            for text_img in text_images {
+                            for (i, text_img) in text_images.into_iter().enumerate() {
+                                trace!("Worker (bytes): Recognizing text for image #{}...", i);
                                 match rec.predict_str(&text_img) {
                                     Ok(text) => results.push(text),
                                     Err(e) => {
+                                        error!("Worker (bytes): Rec::predict_str failed for image #{}: {:?}", i, e);
                                         let _ = result_sender.send(Err(e));
                                         break;
                                     }
                                 }
                             }
+                            debug!("Worker (bytes): All text images recognized for ProcessOcr.");
                             let _ = result_sender.send(Ok(results));
                         }
                         Err(e) => {
+                            error!("Worker (bytes): det.find_text_img failed for ProcessOcr: {:?}", e);
                             let _ = result_sender.send(Err(e));
                         }
                     }
@@ -558,53 +644,65 @@ impl OcrEngine {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing GetTextImagesEfficient request.");
                     let result = det.find_text_img_efficient(&image);
+                    debug!("Worker (bytes): GetTextImagesEfficient result obtained.");
                     let _ = result_sender.send(result);
                 }
                 OcrRequest::ProcessOcrEfficient {
                     image,
                     result_sender,
                 } => {
+                    debug!("Worker (bytes): Processing ProcessOcrEfficient request.");
                     // 使用高效裁剪先检测文本区域
+                    debug!("Worker (bytes): Calling det.find_text_img_efficient for ProcessOcrEfficient.");
                     match det.find_text_img_efficient(&image) {
                         Ok(text_images) => {
+                            debug!("Worker (bytes): det.find_text_img_efficient returned {} images. Starting recognition.", text_images.len());
                             // 识别每个文本区域
                             let mut results = Vec::with_capacity(text_images.len());
-                            for text_img in text_images {
+                            for (i, text_img) in text_images.into_iter().enumerate() {
+                                trace!("Worker (bytes): Recognizing text for image #{}...", i);
                                 match rec.predict_str(&text_img) {
                                     Ok(text) => results.push(text),
                                     Err(e) => {
+                                        error!("Worker (bytes): Rec::predict_str failed for image #{}: {:?}", i, e);
                                         let _ = result_sender.send(Err(e));
                                         break;
                                     }
                                 }
                             }
+                            debug!("Worker (bytes): All text images recognized for ProcessOcrEfficient.");
                             let _ = result_sender.send(Ok(results));
                         }
                         Err(e) => {
+                            error!("Worker (bytes): det.find_text_img_efficient failed for ProcessOcrEfficient: {:?}", e);
                             let _ = result_sender.send(Err(e));
                         }
                     }
                 }
                 OcrRequest::Shutdown => {
+                    info!("Worker (bytes): Received Shutdown request, exiting loop.");
                     // 收到关闭请求，退出循环
                     break;
                 }
             }
         }
-
+        trace!("OCR worker thread (from bytes) finished.");
         Ok(())
     }
 }
 
 impl Drop for OcrEngine {
     fn drop(&mut self) {
+        trace!("OcrEngine::drop called, sending shutdown request.");
         // 发送关闭请求
         let _ = self.request_sender.send(OcrRequest::Shutdown);
 
         // 等待工作线程完成
         if let Some(handle) = self.worker_handle.take() {
             let _ = handle.join();
+            trace!("Worker thread joined successfully.");
         }
     }
 }
@@ -630,18 +728,28 @@ impl OcrEngineManager {
         rec_model_path: impl AsRef<Path>,
         keys_path: impl AsRef<Path>,
     ) -> OcrResult<()> {
-        let engine = OcrEngine::new(det_model_path, rec_model_path, keys_path)?;
+        trace!("OcrEngineManager::initialize called.");
+        let engine = OcrEngine::new(det_model_path, rec_model_path, keys_path)
+            .map_err(|e| {
+                error!("OcrEngine::new failed during OcrEngineManager::initialize: {:?}", e);
+                e
+            })?;
 
         // 获取或初始化全局实例
-        let instance = INSTANCE.get_or_init(|| Arc::new(Mutex::new(None)));
+        let instance = INSTANCE.get_or_init(|| {
+            trace!("OcrEngineManager: INSTANCE not yet initialized, creating new Arc<Mutex<None>>.");
+            Arc::new(Mutex::new(None))
+        });
 
         // 更新引擎实例
         let mut guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during initialize.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         *guard = Some(engine);
-
+        info!("OCR Engine successfully initialized with tracing support.");
+        trace!("OcrEngineManager initialized.");
         Ok(())
     }
 
@@ -656,6 +764,7 @@ impl OcrEngineManager {
         merge_boxes: bool,
         merge_threshold: i32,
     ) -> OcrResult<()> {
+        trace!("OcrEngineManager::initialize_with_config called.");
         let engine = OcrEngine::new_with_config(
             det_model_path,
             rec_model_path,
@@ -663,18 +772,26 @@ impl OcrEngineManager {
             rect_border_size,
             merge_boxes,
             merge_threshold,
-        )?;
+        )
+            .map_err(|e| {
+                error!("OcrEngine::new_with_config failed during OcrEngineManager::initialize_with_config: {:?}", e);
+                e
+            })?;
 
         // 获取或初始化全局实例
-        let instance = INSTANCE.get_or_init(|| Arc::new(Mutex::new(None)));
+        let instance = INSTANCE.get_or_init(|| {
+            trace!("OcrEngineManager: INSTANCE not yet initialized, creating new Arc<Mutex<None>>.");
+            Arc::new(Mutex::new(None))
+        });
 
         // 更新引擎实例
         let mut guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during initialize_with_config.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         *guard = Some(engine);
-
+        trace!("OcrEngineManager::initialize_with_config finished.");
         Ok(())
     }
 
@@ -689,6 +806,7 @@ impl OcrEngineManager {
         merge_boxes: bool,
         merge_threshold: i32,
     ) -> OcrResult<()> {
+        trace!("OcrEngineManager::initialize_with_config_and_bytes called.");
         let engine = OcrEngine::new_with_config_and_bytes(
             det_model_data,
             rec_model_data,
@@ -696,18 +814,26 @@ impl OcrEngineManager {
             rect_border_size,
             merge_boxes,
             merge_threshold,
-        )?;
+        )
+            .map_err(|e| {
+                error!("OcrEngine::new_with_config_and_bytes failed during OcrEngineManager::initialize_with_config_and_bytes: {:?}", e);
+                e
+            })?;
 
         // 获取或初始化全局实例
-        let instance = INSTANCE.get_or_init(|| Arc::new(Mutex::new(None)));
+        let instance = INSTANCE.get_or_init(|| {
+            trace!("OcrEngineManager: INSTANCE not yet initialized, creating new Arc<Mutex<None>>.");
+            Arc::new(Mutex::new(None))
+        });
 
         // 更新引擎实例
         let mut guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during initialize_with_config_and_bytes.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         *guard = Some(engine);
-
+        trace!("OcrEngineManager::initialize_with_config_and_bytes finished.");
         Ok(())
     }
 
@@ -715,24 +841,33 @@ impl OcrEngineManager {
     ///
     /// Get the global OCR engine instance
     pub fn get_instance() -> OcrResult<Arc<Mutex<Option<OcrEngine>>>> {
+        trace!("OcrEngineManager::get_instance called.");
         INSTANCE
             .get()
             .cloned()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when get_instance called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })
     }
 
     /// 在图像中检测文本区域
     ///
     /// Detect text regions in the image
     pub fn detect_text(image: DynamicImage) -> OcrResult<Vec<DynamicImage>> {
+        trace!("OcrEngineManager::detect_text called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during detect_text.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when detect_text called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.detect_text(image)
     }
@@ -741,14 +876,19 @@ impl OcrEngineManager {
     ///
     /// Get text region rectangles
     pub fn get_text_rects(image: &DynamicImage) -> OcrResult<Vec<Rect>> {
+        trace!("OcrEngineManager::get_text_rects called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during get_text_rects.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when get_text_rects called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.get_text_rects(image)
     }
@@ -757,14 +897,19 @@ impl OcrEngineManager {
     ///
     /// Get text region images
     pub fn get_text_images(image: &DynamicImage) -> OcrResult<Vec<DynamicImage>> {
+        trace!("OcrEngineManager::get_text_images called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during get_text_images.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when get_text_images called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.get_text_images(image)
     }
@@ -773,14 +918,19 @@ impl OcrEngineManager {
     ///
     /// Recognize text in the image
     pub fn recognize_text(image: DynamicImage) -> OcrResult<String> {
+        trace!("OcrEngineManager::recognize_text called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during recognize_text.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when recognize_text called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.recognize_text(image)
     }
@@ -789,14 +939,19 @@ impl OcrEngineManager {
     ///
     /// Complete OCR processing, detecting and recognizing all text in the image
     pub fn process_ocr(image: DynamicImage) -> OcrResult<Vec<String>> {
+        trace!("OcrEngineManager::process_ocr called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during process_ocr.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when process_ocr called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.process_ocr(image)
     }
@@ -805,14 +960,19 @@ impl OcrEngineManager {
     ///
     /// Get text region images using efficient cropping
     pub fn get_text_images_efficient(image: &DynamicImage) -> OcrResult<Vec<DynamicImage>> {
+        trace!("OcrEngineManager::get_text_images_efficient called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during get_text_images_efficient.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when get_text_images_efficient called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.get_text_images_efficient(image)
     }
@@ -821,14 +981,19 @@ impl OcrEngineManager {
     ///
     /// Complete OCR processing using efficient cropping
     pub fn process_ocr_efficient(image: DynamicImage) -> OcrResult<Vec<String>> {
+        trace!("OcrEngineManager::process_ocr_efficient called.");
         let instance = Self::get_instance()?;
         let guard = instance.lock().map_err(|_| {
+            error!("OcrEngineManager: Failed to acquire lock on OCR engine manager during process_ocr_efficient.");
             OcrError::EngineError("Failed to acquire lock on OCR engine manager".to_string())
         })?;
 
         let engine = guard
             .as_ref()
-            .ok_or_else(|| OcrError::EngineError("OCR engine not initialized".to_string()))?;
+            .ok_or_else(|| {
+                error!("OcrEngineManager: OCR engine not initialized when process_ocr_efficient called.");
+                OcrError::EngineError("OCR engine not initialized".to_string())
+            })?;
 
         engine.process_ocr_efficient(image)
     }
